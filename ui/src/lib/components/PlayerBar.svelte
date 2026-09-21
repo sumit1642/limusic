@@ -33,7 +33,7 @@
 		openAddToPlaylist,
 		openMiniPlayer,
 		toggleMute,
-		toggleNowPlayingLike,
+		toggleNowPlayingRating,
 		wheelVolume
 	} from '$lib/player.svelte';
 	import { thumb } from '$lib/thumb';
@@ -60,7 +60,7 @@
 
 	function toggleLike() {
 		if (playback.rating !== 'like') justLiked = true;
-		toggleNowPlayingLike();
+		toggleNowPlayingRating();
 	}
 
 	const fmt = (secs: number) => {
@@ -249,6 +249,8 @@
 					<TrackMenu
 						song={currentSong}
 						linksOnly
+						playlistId={playback.queue.sourceId}
+						queueIndex={playback.queue.currentIndex}
 						onAdd={() => openAddToPlaylist(currentSong!)}
 						triggerClass="inline-flex size-8 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground"
 					/>

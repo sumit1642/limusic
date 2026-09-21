@@ -19,13 +19,14 @@
 	import { Input } from '$lib/components/ui/input';
 	import { Switch } from '$lib/components/ui/switch';
 	import { Slider } from '$lib/components/ui/slider';
+	import { LEVELS as ZOOM_LEVELS, setZoom, zoom } from '$lib/zoom.svelte';
 	import { Alert, AlertDescription } from '$lib/components/ui/alert';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import * as Select from '$lib/components/ui/select';
 	import { HELP_COMBO } from '$lib/shortcuts';
 	import { copyText } from '$lib/clipboard';
 	import * as api from '$lib/api';
-	import { blocked, prefs, ui, toast, unblockArtist } from '$lib/player.svelte';
+	import { blocked, prefs, refreshView, ui, toast, unblockArtist } from '$lib/player.svelte';
 	import { win } from '$lib/win.svelte';
 	import ColorPicker from '$lib/components/ColorPicker.svelte';
 	import Changelog from '$lib/components/Changelog.svelte';
@@ -83,6 +84,8 @@
 	const currentTheme = $derived(THEMES.find((t) => t.id === theme.id) ?? THEMES[0]);
 
 	// --- Themes tab ---
+	const pct = (level: number) => `${Math.round(level * 100)}%`;
+
 	type FontKey = 'fontSans' | 'fontHeading';
 	const FONT_ROWS: { key: FontKey; label: string; hint: string }[] = $derived([
 		{
@@ -292,11 +295,25 @@
 	const quality = $derived(settings.quality ?? 'HIGH');
 	const historyOn = $derived(settings.enable_history !== 'false');
 	const autoplayOn = $derived(settings.autoplay !== 'false');
+	// Off by default: experimental, and it runs a second decoder while tracks overlap.
+	const crossfadeOn = $derived(settings.crossfade === 'true');
+	// Clamped like the player clamps it (`set_crossfade`), so a stored value from anywhere but this
+	// slider cannot show a number the audio will not use.
+	const crossfadeSecs = $derived.by(() => {
+		const secs = Number(settings.crossfade_secs ?? '5');
+		return Number.isFinite(secs) ? Math.min(10, Math.max(1, secs)) : 5;
+	});
 	const hideVideosOn = $derived(settings.hide_videos === 'true');
 	// Off until the setting is turned on: still experimental, so nobody gets video they didn't ask
 	// for. Same test in `player.svelte.ts`, which hydrates `prefs` at launch.
 	const musicVideosOn = $derived(settings.music_videos === 'true');
 	const boiduOn = $derived(settings.lyrics_boidu !== 'false');
+	// Off by default: the full byline is what YouTube credits, and cutting it is a preference
+	// with a real failure mode (a comma-joined duo name), not a fix (issue #231).
+	const lastfmPrimaryOn = $derived(settings.lastfm_primary_artist === 'true');
+	// Sub-setting of the one above: also cut at "&", which costs the joint acts that have their
+	// own Last.fm page. Only reachable while the parent is on.
+	const lastfmStrictOn = $derived(settings.lastfm_primary_strict === 'true');
 	const preventDuplicatesOn = $derived(settings.prevent_duplicates === 'true');
 	// Off by default: shuffle applies to the queue it was turned on for (issue #117).
 	const stickyShuffleOn = $derived(settings.sticky_shuffle === 'true');
@@ -340,6 +357,16 @@
 		await api.setSetting('autoplay', settings.autoplay);
 	}
 
+	async function setCrossfade(on: boolean) {
+		settings.crossfade = on ? 'true' : 'false';
+		await api.setSetting('crossfade', settings.crossfade);
+	}
+
+	async function setCrossfadeSecs(secs: number) {
+		settings.crossfade_secs = String(secs);
+		await api.setSetting('crossfade_secs', settings.crossfade_secs);
+	}
+
 	// Also lands in `prefs`, which is where the player view reads it: the switch has to take effect
 	// on the track that's already playing, not on the next launch.
 	async function setMusicVideos(on: boolean) {
@@ -351,6 +378,16 @@
 	async function setHideVideos(on: boolean) {
 		settings.hide_videos = on ? 'true' : 'false';
 		await api.setSetting('hide_videos', settings.hide_videos);
+	}
+
+	async function setLastfmPrimary(on: boolean) {
+		settings.lastfm_primary_artist = on ? 'true' : 'false';
+		await api.setSetting('lastfm_primary_artist', settings.lastfm_primary_artist);
+	}
+
+	async function setLastfmStrict(on: boolean) {
+		settings.lastfm_primary_strict = on ? 'true' : 'false';
+		await api.setSetting('lastfm_primary_strict', settings.lastfm_primary_strict);
 	}
 
 	async function setBoidu(on: boolean) {
@@ -609,6 +646,11 @@
 									control: radiusSlider
 								})}
 								{@render row({
+									title: t('settings.themes.zoom'),
+									desc: t('settings.themes.zoom_hint'),
+									control: zoomSelect
+								})}
+								{@render row({
 									title: t('settings.themes.app_icon'),
 									desc: t('settings.themes.app_icon_hint'),
 									control: appIconButtons
@@ -689,6 +731,21 @@
 									control: autoplaySwitch
 								})}
 								{@render row({
+									title: t('settings.playback.crossfade'),
+									badge: t('settings.themes.experimental'),
+									desc: t('settings.playback.crossfade_hint'),
+									control: crossfadeSwitch,
+									tall: true
+								})}
+								{#if crossfadeOn}
+									{@render row({
+										title: t('settings.playback.crossfade_duration'),
+										desc: t('settings.playback.crossfade_duration_hint'),
+										control: crossfadeSlider,
+										tall: true
+									})}
+								{/if}
+								{@render row({
 									title: t('settings.playback.prevent_duplicates'),
 									desc: t('settings.playback.prevent_duplicates_hint'),
 									control: dupSwitch,
@@ -728,6 +785,25 @@
 									desc: t('settings.playback.blocked_artists_hint'),
 									below: blockedList
 								})}
+							</div>
+						</section>
+						<section class={GROUP}>
+							<h3 class={LABEL}>{t('settings.sections.scrobbling')}</h3>
+							<div class={CARD}>
+								{@render row({
+									title: t('settings.playback.lastfm_primary_artist'),
+									desc: t('settings.playback.lastfm_primary_artist_hint'),
+									control: lastfmPrimarySwitch,
+									tall: true
+								})}
+								{#if lastfmPrimaryOn}
+									{@render row({
+										title: t('settings.playback.lastfm_primary_strict'),
+										desc: t('settings.playback.lastfm_primary_strict_hint'),
+										control: lastfmStrictSwitch,
+										tall: true
+									})}
+								{/if}
 							</div>
 						</section>
 						<section class={GROUP}>
@@ -863,11 +939,13 @@
 </Dialog.Root>
 
 <!-- Controls. Split out so the rows above read as a list of settings rather than a wall of markup. -->
+<!-- The picker refreshes the page behind the dialog once Rust has the new language: half of what is
+     on screen is YouTube's own text (#274), and that half only changes on the next fetch. -->
 {#snippet languagePicker()}
 	<Select.Root
 		type="single"
 		value={currentLocale.id}
-		onValueChange={(v) => setLocale(v as LocaleId)}
+		onValueChange={(v) => setLocale(v as LocaleId).then(refreshView)}
 	>
 		<Select.Trigger class="w-44 shrink-0" aria-label={t('settings.general.language')}>
 			<span class="flex-1 truncate text-left">{currentLocaleLabel}</span>
@@ -890,6 +968,25 @@
 		onCheckedChange={setSystemTitlebar}
 	/>{/snippet}
 {#snippet autoplaySwitch()}<Switch checked={autoplayOn} onCheckedChange={setAutoplay} />{/snippet}
+
+{#snippet crossfadeSwitch()}<Switch checked={crossfadeOn} onCheckedChange={setCrossfade} />{/snippet}
+
+{#snippet crossfadeSlider()}
+	<div class="flex w-44 shrink-0 items-center gap-3">
+		<Slider
+			type="single"
+			aria-label={t('settings.playback.crossfade_duration')}
+			min={1}
+			max={10}
+			step={1}
+			value={crossfadeSecs}
+			onValueChange={setCrossfadeSecs}
+		/>
+		<span class="w-8 shrink-0 text-right font-mono text-xs text-muted-foreground">
+			{t('settings.playback.crossfade_seconds', { secs: crossfadeSecs })}
+		</span>
+	</div>
+{/snippet}
 {#snippet dupSwitch()}<Switch
 		checked={preventDuplicatesOn}
 		onCheckedChange={setPreventDuplicates}
@@ -900,6 +997,14 @@
 	/>{/snippet}
 {#snippet musicVideoSwitch()}<Switch checked={musicVideosOn} onCheckedChange={setMusicVideos} />{/snippet}
 {#snippet hideVideoSwitch()}<Switch checked={hideVideosOn} onCheckedChange={setHideVideos} />{/snippet}
+{#snippet lastfmPrimarySwitch()}<Switch
+		checked={lastfmPrimaryOn}
+		onCheckedChange={setLastfmPrimary}
+	/>{/snippet}
+{#snippet lastfmStrictSwitch()}<Switch
+		checked={lastfmStrictOn}
+		onCheckedChange={setLastfmStrict}
+	/>{/snippet}
 {#snippet boiduSwitch()}<Switch checked={boiduOn} onCheckedChange={setBoidu} />{/snippet}
 {#snippet bannerSwitch()}<Switch checked={updateBannerOn} onCheckedChange={setUpdateBanner} />{/snippet}
 {#snippet openPlayerSwitch()}<Switch
@@ -986,6 +1091,19 @@
 			{effective.radius.toFixed(2)}
 		</span>
 	</div>
+{/snippet}
+
+{#snippet zoomSelect()}
+	<Select.Root type="single" value={String(zoom.level)} onValueChange={(v) => setZoom(Number(v))}>
+		<Select.Trigger class="w-44 shrink-0" aria-label={t('a11y.zoom')}>
+			<span class="flex-1 text-left">{pct(zoom.level)}</span>
+		</Select.Trigger>
+		<Select.Content>
+			{#each ZOOM_LEVELS as lv (lv)}
+				<Select.Item value={String(lv)} label={pct(lv)}>{pct(lv)}</Select.Item>
+			{/each}
+		</Select.Content>
+	</Select.Root>
 {/snippet}
 
 {#snippet fontSelect(key: FontKey, label: string)}

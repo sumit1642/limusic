@@ -1,6 +1,7 @@
 //! Limusic Tauri app. Wires transport + player + db + orchestrator behind the command boundary.
 
 mod appicon;
+mod audioproxy;
 mod blocked;
 mod cipher;
 mod commands;
@@ -306,7 +307,26 @@ pub fn run() {
             // Session bootstrap (context/15 startup ordering): load the persisted login session
             // (cookie/dataSyncId/visitorData) from settings; fetch visitorData anonymously
             // (context/04 §A) only if we've never stored one.
-            let proxy = db.get_setting("proxy");
+            // `LIMUSIC_PROXY` overrides the stored setting, so a region-locked surface can be
+            // tested for one run without a system-wide VPN (CLAUDE.md).
+            let proxy = std::env::var("LIMUSIC_PROXY")
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+                .or_else(|| db.get_setting("proxy").filter(|p| !p.trim().is_empty()))
+                // The setting is free text from the UI. An unparseable one used to fail
+                // `InnerTube::new` below, and that `expect` bricks the app: no window, so no way
+                // to reach settings and undo it. Drop it once here, for every consumer.
+                .filter(|p| match reqwest::Proxy::all(p.as_str()) {
+                    Ok(_) => true,
+                    // Scheme only: the URI can carry credentials in its userinfo (see http.rs).
+                    Err(e) => {
+                        let scheme = p.split_once("://").map_or("(none)", |(s, _)| s);
+                        tracing::warn!(scheme, "unusable proxy setting, going direct: {e}");
+                        false
+                    }
+                });
+            // Before the first fetch: the shared client builds itself on first use.
+            http::set_proxy(proxy.as_deref());
             let cookie = db.get_setting("session_cookie").filter(|s| !s.is_empty());
             let data_sync_id = state::persisted_data_sync_id(&db);
             let visitor_data = db.get_setting("visitor_data").filter(|s| !s.is_empty());
@@ -321,6 +341,13 @@ pub fn run() {
             let visitor_for_prewarm = visitor_data.clone();
             let session = Session { locale: Locale::default(), visitor_data, data_sync_id, cookie };
             let it = InnerTube::new(session, proxy.as_deref()).expect("build InnerTube");
+            // Shelf titles, mood chips and playlist subtitles are YouTube's text, so the UI's
+            // language has to go out with the request (#274). Persisted rather than pushed from the
+            // SPA at startup, because the first home fetch is already in flight by the time the
+            // webview could tell us; the SPA writes it whenever it changes (`set_setting`).
+            if let Some(hl) = db.get_setting("locale") {
+                it.set_locale(&hl);
+            }
             it.set_hide_videos(db.get_setting("hide_videos").as_deref() == Some("true"));
             // Read while `db` is still ours; the window is decorated further down, once the rest of
             // the setup that could fail is out of the way.
@@ -330,9 +357,14 @@ pub fn run() {
             let clients = Clients::bundled();
 
             let mut player = Player::new(cache_dir.to_str().unwrap()).expect("init libmpv");
+            // The audio bytes are the one request that never went through the proxy setting (#241).
+            if let Err(e) = player.set_http_proxy(proxy.as_deref()) {
+                tracing::warn!("mpv refused the proxy setting: {e}");
+            }
             // Before anything can play: the first track of a restored queue has to come out at the
             // level the user left, not at 100.
             let _ = player.set_volume(state::saved_volume(&db));
+            player.set_crossfade(state::saved_crossfade(&db));
             let events = player.take_events().expect("player events");
 
             // Phase 2 extraction stack: cipher + PoToken hidden webviews behind the orchestrator.
@@ -391,6 +423,11 @@ pub fn run() {
             // never sees a googlevideo URL (context/11). videoproxy.rs explains why a socket and
             // not a custom scheme.
             videoproxy::start(app_state.clone());
+
+            // mpv's audio goes through a second loopback socket so the open-ended range ffmpeg
+            // sends becomes bounded ranges upstream, which is the difference between 32 KB/s and
+            // several MB/s on the same URL. audioproxy.rs has the measurements.
+            audioproxy::start();
 
             // Local music artwork reaches the webview over the asset protocol, whose configured
             // scope is empty — the folders it may read are the ones the user picked (local.rs).
@@ -466,7 +503,11 @@ pub fn run() {
                     // 401 it may come back with goes down the same healing path as any other.
                     if st.it.is_logged_in() {
                         if let Some(client) = st.clients.get(innertube::METADATA_CLIENT) {
-                            let _ = st.it.account_menu(client).await;
+                            // No heal-waiting for it: this runs *before* the loop below, so
+                            // there is nobody to answer a wait yet, and a dead session would
+                            // stall the healer's own startup for the whole timeout. Its 401
+                            // raises the flag instead, and the loop picks that up on entry.
+                            let _ = innertube::without_healing(st.it.account_menu(client)).await;
                         }
                     }
                     // Google rolls its short-lived tokens on the requests the app makes, so an
@@ -477,7 +518,16 @@ pub fn run() {
                     loop {
                         tokio::select! {
                             _ = rejected.notified() => {
-                                session::refresh_session(app_handle.clone(), st.clone()).await;
+                                // The guard is what parked requests are watching: while it lives
+                                // they keep waiting however long this takes, and dropping it
+                                // releases them whether or not anything was re-minted. They retry
+                                // either way, so the ones that really are dead can say so instead
+                                // of holding a spinner until the timeout.
+                                let _heal = st.it.begin_heal();
+                                innertube::without_healing(
+                                    session::refresh_session(app_handle.clone(), st.clone()),
+                                )
+                                .await;
                             }
                             _ = rotated.notified() => st.persist_rotated_cookie(),
                             _ = keepalive.tick() => st.keep_session_alive().await,
@@ -566,6 +616,7 @@ pub fn run() {
             commands::search,
             commands::search_all,
             commands::search_cards,
+            commands::search_videos,
             commands::play,
             commands::play_index,
             commands::remove_from_queue,
@@ -630,6 +681,7 @@ pub fn run() {
             commands::set_album_saved,
             commands::add_to_playlist,
             commands::remove_from_playlist,
+            commands::remove_many_from_playlist,
             commands::create_playlist,
             commands::edit_playlist_details,
             commands::set_playlist_cover,
@@ -669,15 +721,21 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 match window.label() {
                     "main" => {
-                        let hide = window
-                            .app_handle()
-                            .try_state::<Arc<AppState>>()
-                            .map(|s| close_hides(s.db.get_setting("close_to_tray").as_deref()))
-                            .unwrap_or(true);
+                        let hide = tray::available()
+                            && window
+                                .app_handle()
+                                .try_state::<Arc<AppState>>()
+                                .map(|s| close_hides(s.db.get_setting("close_to_tray").as_deref()))
+                                .unwrap_or(true);
                         if hide {
                             api.prevent_close();
                             let _ = window.hide();
                             tray::set_main_visible(window.app_handle(), false);
+                        } else if let Some(state) = window.app_handle().try_state::<Arc<AppState>>()
+                        {
+                            // Really quitting: persist the exact resume position, the same thing
+                            // the tray's Quit item does.
+                            state.flush_position();
                         }
                     }
                     // Nothing in the widget closes it, but a WM shortcut still can. Turn that into
@@ -710,6 +768,9 @@ pub fn run() {
 }
 
 /// ✕ hides to tray unless the user explicitly set close_to_tray=false (unset → default on).
+///
+/// Gated by [`tray::available`] at the call site: with no tray to click, hiding would strand the
+/// app with no window (#232).
 fn close_hides(setting: Option<&str>) -> bool {
     setting != Some("false")
 }
